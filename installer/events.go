@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,55 +76,56 @@ func (i *Installer) Unsubscribe(sub *Subscription) {
 	i.subscriptions = subscriptions
 }
 
-func (i *Installer) processEventRows(rows *sql.Rows, events *[]*Event) {
-	for rows.Next() {
-		var err error
-		event := &Event{}
-		if err := rows.Scan(&event.ID, &event.ClusterID, &event.ResourceType, &event.ResourceID, &event.Type, &event.Timestamp, &event.Description); err != nil {
-			i.logger.Debug(fmt.Sprintf("GetEventsSince Scan Error: %s", err.Error()))
-			continue
+func (i *Installer) processEvent(event *Event) bool {
+	var err error
+	if event.Type == "log" {
+		if c, err := i.FindBaseCluster(event.ClusterID); err != nil || (err == nil && c.State == "running") {
+			return false
 		}
-		if event.Type == "log" {
-			if c, err := i.FindBaseCluster(event.ClusterID); err != nil || (err == nil && c.State == "running") {
-				continue
-			}
-		}
-		if event.Type == "new_cluster" || event.Type == "install_done" {
-			event.Cluster, err = i.FindBaseCluster(event.ClusterID)
-			if err != nil {
-				i.logger.Debug(fmt.Sprintf("GetEventsSince Error finding cluster %s: %s", event.ClusterID, err.Error()))
-				continue
-			}
-		}
-		switch event.ResourceType {
-		case "":
-		case "prompt":
-			p := &Prompt{}
-			if err := i.db.QueryRow(`SELECT ID, Type, Message, Yes, Input, Resolved FROM prompts WHERE ID == $1 AND DeletedAt IS NULL`, event.ResourceID).Scan(&p.ID, &p.Type, &p.Message, &p.Yes, &p.Input, &p.Resolved); err != nil {
-				i.logger.Debug(fmt.Sprintf("GetEventsSince Prompt Scan Error: %s", err.Error()))
-				continue
-			}
-			event.Resource = p
-		case "credential":
-			if event.Type == "new_credential" {
-				creds := &Credential{}
-				if err := i.db.QueryRow(`SELECT Type, Name, ID FROM credentials WHERE ID == $1 AND DeletedAt IS NULL`, event.ResourceID).Scan(&creds.Type, &creds.Name, &creds.ID); err != nil {
-					if err != sql.ErrNoRows {
-						i.logger.Debug(fmt.Sprintf("GetEventsSince Credential Scan Error: %s", err.Error()))
-					}
-					continue
-				}
-				event.Resource = creds
-			}
-		default:
-			i.logger.Debug(fmt.Sprintf("GetEventsSince unsupported ResourceType \"%s\"", event.ResourceType))
-		}
-		*events = append(*events, event)
 	}
+	if event.Type == "new_cluster" || event.Type == "install_done" {
+		event.Cluster, err = i.FindBaseCluster(event.ClusterID)
+		if err != nil {
+			i.logger.Debug(fmt.Sprintf("GetEventsSince Error finding cluster %s: %s", event.ClusterID, err.Error()))
+			return false
+		}
+	}
+	switch event.ResourceType {
+	case "":
+	case "prompt":
+		p := &Prompt{}
+		if err := i.db.QueryRow(`SELECT ID, Type, Message, Yes, Input, Resolved FROM prompts WHERE ID == $1 AND DeletedAt IS NULL`, event.ResourceID).Scan(&p.ID, &p.Type, &p.Message, &p.Yes, &p.Input, &p.Resolved); err != nil {
+			i.logger.Debug(fmt.Sprintf("GetEventsSince Prompt Scan Error: %s", err.Error()))
+			return false
+		}
+		event.Resource = p
+	case "credential":
+		if event.Type == "new_credential" {
+			creds := &Credential{}
+			if err := i.db.QueryRow(`SELECT Type, Name, ID FROM credentials WHERE ID == $1 AND DeletedAt IS NULL`, event.ResourceID).Scan(&creds.Type, &creds.Name, &creds.ID); err != nil {
+				if err != sql.ErrNoRows {
+					i.logger.Debug(fmt.Sprintf("GetEventsSince Credential Scan Error: %s", err.Error()))
+				}
+				return false
+			}
+			event.Resource = creds
+		}
+	default:
+		i.logger.Debug(fmt.Sprintf("GetEventsSince unsupported ResourceType \"%s\"", event.ResourceType))
+	}
+	return true
+}
+
+type ByTimestamp []*Event
+
+func (e ByTimestamp) Len() int      { return len(e) }
+func (e ByTimestamp) Swap(i, j int) { e[i], e[j] = e[j], e[i] }
+func (e ByTimestamp) Less(i, j int) bool {
+	return e[j].Timestamp.After(e[i].Timestamp)
 }
 
 func (i *Installer) GetEventsSince(eventID string) []*Event {
-	var events []*Event
+	events := make([]*Event, 0, len(i.events))
 	var ts time.Time
 	if eventID != "" {
 		nano, err := strconv.ParseInt(strings.TrimPrefix(eventID, "event-"), 10, 64)
@@ -133,25 +135,42 @@ func (i *Installer) GetEventsSince(eventID string) []*Event {
 			ts = time.Unix(0, nano)
 		}
 	}
+
 	priority := []string{"new_cluster", "new_credential", "cluster_state", "prompt"}
 	for _, eventType := range priority {
-		rows, err := i.db.Query(`SELECT ID, ClusterID, ResourceType, ResourceID, Type, Timestamp, Description FROM events WHERE Type == $1 AND Timestamp > $2 AND DeletedAt IS NULL ORDER BY Timestamp`, eventType, ts)
-		if err != nil {
-			i.logger.Debug(fmt.Sprintf("GetEventsSince SQL Error: %s", err.Error()))
-			return events
+		for _, e := range i.events {
+			if !e.Timestamp.After(ts) {
+				continue
+			}
+			if e.Type == eventType {
+				i.processEvent(e)
+				events = append(events, e)
+			}
 		}
-		i.processEventRows(rows, &events)
 	}
-	priorityTypesList := make([]string, len(priority))
-	for idx, eventType := range priority {
-		priorityTypesList[idx] = fmt.Sprintf(`"%s"`, eventType)
+
+	isStringIn := func(str string, strs []string) bool {
+		for _, s := range strs {
+			if str == s {
+				return true
+			}
+		}
+		return false
 	}
-	rows, err := i.db.Query(fmt.Sprintf(`SELECT ID, ClusterID, ResourceType, ResourceID, Type, Timestamp, Description FROM events WHERE Type NOT IN (%s) AND Timestamp > $1 AND DeletedAt IS NULL ORDER BY Timestamp`, strings.Join(priorityTypesList, ",")), ts)
-	if err != nil {
-		i.logger.Debug(fmt.Sprintf("GetEventsSince SQL Error: %s", err.Error()))
-		return events
+
+	for _, e := range i.events {
+		if !e.Timestamp.After(ts) {
+			continue
+		}
+		if isStringIn(e.Type, priority) {
+			continue
+		}
+		i.processEvent(e)
+		events = append(events, e)
 	}
-	i.processEventRows(rows, &events)
+
+	sort.Sort(ByTimestamp(events))
+
 	return events
 }
 
@@ -179,6 +198,10 @@ func (i *Installer) SendEvent(event *Event) {
 	if err != nil {
 		i.logger.Debug(fmt.Sprintf("SendEvent dbInsertItem error: %s", err.Error()))
 	}
+
+	i.eventsMtx.Lock()
+	i.events = append(i.events, event)
+	i.eventsMtx.Unlock()
 
 	for _, sub := range i.subscriptions {
 		go sub.SendEvents(i)

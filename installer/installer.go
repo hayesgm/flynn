@@ -17,11 +17,13 @@ var ClusterNotFoundError = errors.New("Cluster not found")
 
 type Installer struct {
 	db            *sql.DB
+	events        []*Event
 	subscriptions []*Subscription
 	clusters      []Cluster
 	logger        log.Logger
 
 	dbMtx        sync.RWMutex
+	eventsMtx    sync.Mutex
 	subscribeMtx sync.Mutex
 	clustersMtx  sync.RWMutex
 }
@@ -35,7 +37,53 @@ func NewInstaller(l log.Logger) *Installer {
 	if err := installer.openDB(); err != nil {
 		panic(err)
 	}
+	if err := installer.loadEventsFromDB(); err != nil {
+		panic(err)
+	}
 	return installer
+}
+
+func (i *Installer) loadEventsFromDB() error {
+	var events []*Event
+	rows, err := i.db.Query(`
+    SELECT ID, Timestamp, Type, ClusterID, ResourceType, ResourceID, Description FROM events WHERE DeletedAt IS NULL
+  `)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		e := &Event{}
+		if err := rows.Scan(&e.ID, &e.Timestamp, &e.Type, &e.ClusterID, &e.ResourceType, &e.ResourceID, &e.Description); err != nil {
+			return err
+		}
+		events = append(events, e)
+	}
+	i.events = events
+	return nil
+}
+
+func (i *Installer) removeClusterEvents(clusterID string) {
+	i.eventsMtx.Lock()
+	defer i.eventsMtx.Unlock()
+	events := make([]*Event, 0, len(i.events))
+	for _, e := range i.events {
+		if e.ClusterID == "" || e.ClusterID != clusterID {
+			events = append(events, e)
+		}
+	}
+	i.events = events
+}
+
+func (i *Installer) removeCredentialEvents(credID string) {
+	i.eventsMtx.Lock()
+	defer i.eventsMtx.Unlock()
+	events := make([]*Event, 0, len(i.events))
+	for _, e := range i.events {
+		if e.ResourceType != "credential" || e.ResourceID != credID {
+			events = append(events, e)
+		}
+	}
+	i.events = events
 }
 
 func (i *Installer) txExec(query string, args ...interface{}) error {
@@ -93,6 +141,7 @@ func (i *Installer) DeleteCredentials(id string) error {
 	if err := i.txExec(`UPDATE events SET DeletedAt = now() WHERE ResourceType == "credential" AND ResourceID == $1`, id); err != nil {
 		return err
 	}
+	i.removeCredentialEvents(id)
 	go i.SendEvent(&Event{
 		Type:         "delete_credential",
 		ResourceType: "credential",
@@ -400,4 +449,5 @@ func (i *Installer) ClusterDeleted(id string) {
 		}
 	}
 	i.clusters = clusters
+	i.removeClusterEvents(id)
 }
